@@ -1,246 +1,361 @@
 # ============================================================
-#  Dashboard News Portefeuille — Streamlit
-#  Pré-requis : pip install streamlit yfinance pandas
-#  Lancement  : streamlit run dashboard.py
+#  Finviz AI Agent — Dashboard Streamlit
+#  Pré-requis : pip install -r requirements.txt
+#  Lancement  : streamlit run app.py
 # ============================================================
 
-import streamlit as st
-import yfinance as yf
-import pandas as pd
+import time
+import random
 from datetime import datetime
 
-# ── Configuration de la page ─────────────────────────────────────────────────
+import pandas as pd
+import streamlit as st
+import altair as alt
+from finvizfinance.quote import finvizfinance
+
+# ============================================================
+#  CONFIGURATION DE LA PAGE
+# ============================================================
 st.set_page_config(
-    page_title="News Portefeuille",
-    page_icon="📈",
+    page_title="Finviz AI Agent",
+    page_icon="📊",
     layout="wide",
 )
 
-# ── CSS personnalisé ─────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-  /* Carte article */
-  .article-card {
-    background: #ffffff;
-    border-radius: 10px;
-    padding: 14px 18px;
-    margin-bottom: 10px;
-    border-left: 4px solid #1a73e8;
-    box-shadow: 0 1px 6px rgba(0,0,0,.07);
-    transition: box-shadow .2s;
-  }
-  .article-card:hover { box-shadow: 0 4px 16px rgba(0,0,0,.12); }
-  .article-title { font-size: 1rem; font-weight: 600; color: #1a1a2e; margin-bottom: 6px; }
-  .article-meta  { font-size: .8rem; color: #888; }
-  .article-meta span { margin-right: 14px; }
-
-  /* Badge ticker */
-  .ticker-badge {
-    display: inline-block;
-    color: #fff;
-    font-size: .75rem;
-    font-weight: 700;
-    padding: 2px 10px;
-    border-radius: 20px;
-    margin-right: 6px;
-    vertical-align: middle;
-  }
-
-  /* Lien article */
-  .read-link {
-    display: inline-block;
-    background: #1a73e8;
-    color: #fff !important;
-    text-decoration: none;
-    padding: 4px 12px;
-    border-radius: 6px;
-    font-size: .78rem;
-    font-weight: 500;
-    margin-top: 8px;
-  }
-  .read-link:hover { background: #1558b0; }
-
-  /* Masquer le menu burger Streamlit */
-  #MainMenu { visibility: hidden; }
-  footer     { visibility: hidden; }
-</style>
-""", unsafe_allow_html=True)
-
-# ── Watchlist par défaut ──────────────────────────────────────────────────────
-WATCHLIST_DEFAUT = [
-    {"nom": "Broadcom",          "ticker": "AVGO"},
-    {"nom": "Marvell Tech",      "ticker": "MRVL"},
-    {"nom": "Credo Technology",  "ticker": "CRDO"},
-    {"nom": "Intel Corp",        "ticker": "INTC"},
-    {"nom": "Poet Technologies", "ticker": "POET"},
+DEFAULT_WATCHLIST = [
+    "AVGO", "MRVL", "MU", "COHR", "LITE", "ALAB", "CRDO",
+    "AMAT", "LRCX", "KLAC", "TER", "VRT", "GEV",
+    "CEG", "VST", "NEE",
 ]
 
-COULEURS = [
-    "#1a73e8", "#e8710a", "#0f9d58", "#6c3483",
-    "#c0392b", "#2471a3", "#117a65", "#784212",
+# Noms de clés Finviz tels que retournés par finvizfinance.
+# Si une clé change dans une future version de la lib, modifier ici uniquement.
+KEY_MAP = {
+    "pe": "P/E",
+    "fwd_pe": "Forward P/E",
+    "peg": "PEG",
+    "oper_margin": "Oper. Margin",
+    "eps_next_y": "EPS next Y",
+    "eps_next_5y": "EPS next 5Y",
+    "rsi": "RSI (14)",
+    "debt_eq": "Debt/Eq",
+    "roe": "ROE",
+    "price": "Price",
+    "52w_high": "52W High",
+}
+
+DIAGNOSTIC_ORDER = [
+    "🟢 Value / Fort potentiel",
+    "🔵 Pure croissance",
+    "🟡 Standard",
+    "⚠️ Surchauffe",
+    "🔴 Non profitable",
 ]
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.title("⚙️ Paramètres")
 
-    st.subheader("Ma Watchlist")
-    st.caption("Format : NOM,TICKER — une ligne par action")
+# ============================================================
+#  LOGIQUE MÉTIER (identique au script original)
+# ============================================================
+def get_metric(m: dict, key: str):
+    key_lower = key.strip().lower()
+    for k, v in m.items():
+        if k.strip().lower() == key_lower:
+            return v
+    return None
 
-    watchlist_text = st.text_area(
-        label="Watchlist",
-        value="\n".join(f"{w['nom']},{w['ticker']}" for w in WATCHLIST_DEFAUT),
-        height=200,
-        label_visibility="collapsed",
-    )
 
-    max_articles = st.slider("Articles par valeur", 1, 10, 5)
+def clean_float(value):
+    if value is None or value == '-':
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
 
-    actualiser = st.button("🔄 Actualiser les news", use_container_width=True, type="primary")
-
-    st.divider()
-    st.caption("Source : Yahoo Finance · yfinance")
-
-# ── Parse watchlist ───────────────────────────────────────────────────────────
-def parse_watchlist(texte: str) -> list:
-    items = []
-    for ligne in texte.strip().splitlines():
-        ligne = ligne.strip()
-        if not ligne or ligne.startswith("#"):
-            continue
-        parts = ligne.split(",")
-        if len(parts) >= 2:
-            items.append({"nom": parts[0].strip(), "ticker": parts[1].strip().upper()})
-    return items
-
-watchlist = parse_watchlist(watchlist_text)
-
-# ── Collecte des news (mise en cache 15 min) ──────────────────────────────────
-@st.cache_data(ttl=900, show_spinner=False)
-def collecter(watchlist_tuple: tuple, max_art: int) -> pd.DataFrame:
-    rows = []
-    for nom, ticker in watchlist_tuple:
+    value = str(value).replace('%', '').replace('$', '').strip()
+    multipliers = {'K': 1e3, 'M': 1e6, 'B': 1e9, 'T': 1e12}
+    if value and value[-1].upper() in multipliers:
         try:
-            stock = yf.Ticker(ticker)
-            news  = stock.news or []
-            for article in news[:max_art]:
-                content = article.get("content", {})
-                titre   = content.get("title") or article.get("title", "—")
-                lien    = (content.get("canonicalUrl", {}).get("url")
-                           or article.get("link", "—"))
-                source  = (content.get("provider", {}).get("displayName")
-                           or article.get("publisher", "—"))
-                ts = content.get("pubDate") or article.get("providerPublishTime")
-                if isinstance(ts, (int, float)):
-                    date_str = datetime.utcfromtimestamp(ts).strftime("%d/%m/%Y %H:%M")
-                elif isinstance(ts, str):
-                    date_str = ts[:16]
-                else:
-                    date_str = "—"
-                rows.append({
-                    "Valeur": nom, "Ticker": ticker,
-                    "Date": date_str, "Source": source,
-                    "Titre": titre, "Lien": lien,
-                })
+            return float(value[:-1]) * multipliers[value[-1].upper()]
+        except ValueError:
+            return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def fetch_single(ticker: str, retries: int = 3):
+    """Récupère les fondamentaux d'un ticker avec retry + pause anti-ban
+    (la pause n'a lieu qu'après un vrai appel réseau, jamais sur du cache)."""
+    for attempt in range(retries):
+        try:
+            stock = finvizfinance(ticker)
+            fundament = stock.ticker_fundament()
+            time.sleep(random.uniform(2.5, 4.5))
+            if not fundament:
+                return None, f"Données vides pour {ticker}."
+            return fundament, None
         except Exception as e:
-            st.warning(f"Erreur pour {nom} ({ticker}) : {e}")
-    return pd.DataFrame(rows)
+            if attempt < retries - 1:
+                time.sleep(5 * (attempt + 1))
+            else:
+                return None, f"Échec définitif pour {ticker} : {e}"
 
-# ── En-tête principal ─────────────────────────────────────────────────────────
-st.title("📈 News Portefeuille")
-st.caption(f"Dernière mise à jour : {datetime.now().strftime('%d/%m/%Y à %H:%M')} · "
-           f"{len(watchlist)} valeur(s) · cache 15 min")
 
-if not watchlist:
-    st.error("⚠️ Aucune valeur dans la watchlist. Ajoutez des lignes NOM,TICKER dans la barre latérale.")
-    st.stop()
+def score(peg, operating_margin, pe, eps_next_y, rsi):
+    reasons = []
 
-# ── Chargement ────────────────────────────────────────────────────────────────
-with st.spinner("Chargement des actualités…"):
-    wl_tuple = tuple((w["nom"], w["ticker"]) for w in watchlist)
-    if actualiser:
-        st.cache_data.clear()
-    df = collecter(wl_tuple, max_articles)
+    if peg is not None:
+        if 0 < peg < 1.0:
+            reasons.append(f"Croissance sous-évaluée (PEG={peg:.2f})")
+        elif peg > 3.0:
+            reasons.append(f"Valorisation tendue (PEG={peg:.2f})")
+
+    if operating_margin is not None:
+        if operating_margin > 20.0:
+            reasons.append(f"Excellente rentabilité ({operating_margin:.1f}%)")
+        elif operating_margin < 0:
+            reasons.append(f"Marge négative ({operating_margin:.1f}%)")
+
+    if rsi is not None:
+        if rsi > 70:
+            reasons.append(f"Surachat (RSI={rsi:.1f})")
+        elif rsi < 30:
+            reasons.append(f"Survente (RSI={rsi:.1f})")
+
+    peg_tendu = peg is not None and peg > 3.0
+    peg_value = peg is not None and 0 < peg < 1.0
+    marge_ok = operating_margin is not None and operating_margin > 15.0
+    marge_neg = operating_margin is not None and operating_margin < 0
+    pe_eleve = pe is not None and pe > 50
+    eps_fort = eps_next_y is not None and eps_next_y > 20.0
+
+    if marge_neg:
+        rating = "🔴 Non profitable"
+    elif peg_tendu:
+        rating = "⚠️ Surchauffe"
+    elif peg_value and marge_ok:
+        rating = "🟢 Value / Fort potentiel"
+    elif pe_eleve and eps_fort and not peg_tendu:
+        rating = "🔵 Pure croissance"
+    else:
+        rating = "🟡 Standard"
+
+    return rating, reasons
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def analyze_ticker(ticker: str, _cache_buster: int):
+    """_cache_buster permet d'invalider le cache via le bouton Rafraîchir
+    sans toucher à la logique métier."""
+    fundament, error = fetch_single(ticker)
+    if fundament is None:
+        return {"Ticker": ticker, "_error": error}
+
+    gm = lambda key: get_metric(fundament, KEY_MAP[key])
+
+    pe = clean_float(gm("pe"))
+    fwd_pe = clean_float(gm("fwd_pe"))
+    peg = clean_float(gm("peg"))
+    operating_margin = clean_float(gm("oper_margin"))
+    eps_next_y = clean_float(gm("eps_next_y"))
+    eps_next_5y = clean_float(gm("eps_next_5y"))
+    rsi = clean_float(gm("rsi"))
+    debt_eq = clean_float(gm("debt_eq"))
+    roe = clean_float(gm("roe"))
+    price = clean_float(gm("price"))
+    high_52w = clean_float(gm("52w_high"))
+
+    dist_52w_high = None
+    if price and high_52w:
+        dist_52w_high = round((price / high_52w - 1) * 100, 1)
+
+    rating, reasons = score(peg, operating_margin, pe, eps_next_y, rsi)
+
+    return {
+        "Ticker": ticker,
+        "Prix": price,
+        "P/E": pe,
+        "Forward P/E": fwd_pe,
+        "PEG": peg,
+        "Marge Opé (%)": operating_margin,
+        "EPS next Y (%)": eps_next_y,
+        "EPS next 5Y (%)": eps_next_5y,
+        "ROE (%)": roe,
+        "Debt/Eq": debt_eq,
+        "RSI (14)": rsi,
+        "Dist. 52W High (%)": dist_52w_high,
+        "Diagnostic": rating,
+        "Points clés": " | ".join(reasons) if reasons else "—",
+        "_error": None,
+    }
+
+
+# ============================================================
+#  ÉTAT DE SESSION
+# ============================================================
+st.session_state.setdefault("cache_buster", 0)
+st.session_state.setdefault("df", pd.DataFrame())
+st.session_state.setdefault("errors", [])
+st.session_state.setdefault("last_run", None)
+
+# ============================================================
+#  SIDEBAR — SAISIE & REFRESH
+# ============================================================
+st.sidebar.title("⚙️ Paramètres")
+
+tickers_input = st.sidebar.text_area(
+    "Tickers à analyser (séparés par des virgules)",
+    value=", ".join(DEFAULT_WATCHLIST),
+    height=100,
+)
+tickers = list(dict.fromkeys(
+    [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
+))
+st.sidebar.caption(f"{len(tickers)} valeur(s) unique(s)")
+
+refresh = st.sidebar.button(
+    "🔄 Rafraîchir les données", use_container_width=True, type="primary"
+)
+
+st.sidebar.divider()
+st.sidebar.subheader("🔎 Filtres")
+filters_placeholder = st.sidebar.container()
+
+# ============================================================
+#  COLLECTE / ANALYSE
+# ============================================================
+auto_run = st.session_state.df.empty and st.session_state.last_run is None
+should_fetch = (refresh or auto_run) and len(tickers) > 0
+
+if should_fetch:
+    if refresh:
+        st.session_state.cache_buster += 1  # invalide le cache → force un vrai refetch
+
+    progress = st.sidebar.progress(0, text="Initialisation…")
+    status = st.sidebar.empty()
+    results = []
+
+    for i, ticker in enumerate(tickers):
+        status.write(f"📡 {ticker}…")
+        results.append(analyze_ticker(ticker, st.session_state.cache_buster))
+        progress.progress((i + 1) / len(tickers), text=f"{ticker} ✓")
+
+    status.empty()
+    progress.empty()
+
+    raw = pd.DataFrame(results)
+    st.session_state.errors = (
+        raw.loc[raw["_error"].notna(), "_error"].tolist() if "_error" in raw else []
+    )
+    st.session_state.df = (
+        raw.loc[raw["_error"].isna()].drop(columns=["_error"])
+        if "_error" in raw else raw
+    )
+    st.session_state.last_run = datetime.now()
+
+df = st.session_state.df
+
+# ============================================================
+#  EN-TÊTE
+# ============================================================
+st.title("📊 Finviz AI Agent")
+st.caption("Analyse automatique des fondamentaux et signaux techniques via Finviz")
+
+if st.session_state.last_run:
+    st.caption(f"Dernière mise à jour : {st.session_state.last_run.strftime('%d/%m/%Y %H:%M:%S')}")
 
 if df.empty:
-    st.warning("Aucune actualité trouvée pour cette sélection.")
+    st.info("👈 Renseigne des tickers dans la barre latérale puis clique sur **Rafraîchir les données**.")
     st.stop()
 
-# ── KPIs ──────────────────────────────────────────────────────────────────────
-k1, k2, k3 = st.columns(3)
-k1.metric("📰 Articles collectés", len(df))
-k2.metric("📊 Valeurs couvertes",  df["Valeur"].nunique())
-k3.metric("📡 Sources distinctes", df["Source"].nunique())
+# ============================================================
+#  FILTRES (construits maintenant que les données existent)
+# ============================================================
+with filters_placeholder:
+    diag_available = [d for d in DIAGNOSTIC_ORDER if d in df["Diagnostic"].unique()]
+    selected_diag = st.multiselect("Diagnostic", diag_available, default=diag_available)
 
-st.divider()
+    peg_ceiling = float(max(10.0, df["PEG"].max(skipna=True) or 10.0))
+    peg_range = st.slider("PEG", 0.0, peg_ceiling, (0.0, peg_ceiling))
 
-# ── Filtres ───────────────────────────────────────────────────────────────────
-col_f1, col_f2 = st.columns([2, 1])
-with col_f1:
-    valeurs_filtre = st.multiselect(
-        "Filtrer par valeur",
-        options=df["Valeur"].unique().tolist(),
-        default=df["Valeur"].unique().tolist(),
-    )
-with col_f2:
-    recherche = st.text_input("🔍 Rechercher dans les titres", placeholder="ex: earnings, AI…")
+    rsi_range = st.slider("RSI (14)", 0, 100, (0, 100))
 
-# Appliquer les filtres
-df_affiche = df[df["Valeur"].isin(valeurs_filtre)]
-if recherche:
-    df_affiche = df_affiche[
-        df_affiche["Titre"].str.contains(recherche, case=False, na=False)
-    ]
+    sortable_cols = [c for c in df.columns if c not in ("Ticker", "Points clés")]
+    default_sort = "Dist. 52W High (%)" if "Dist. 52W High (%)" in sortable_cols else sortable_cols[0]
+    sort_col = st.selectbox("Trier par", sortable_cols, index=sortable_cols.index(default_sort))
+    sort_asc = st.checkbox("Ordre croissant", value=True)
 
-st.caption(f"{len(df_affiche)} article(s) affiché(s)")
-st.divider()
+mask = df["Diagnostic"].isin(selected_diag)
+mask &= df["PEG"].isna() | df["PEG"].between(*peg_range)
+mask &= df["RSI (14)"].isna() | df["RSI (14)"].between(*rsi_range)
+filtered = df.loc[mask].sort_values(sort_col, ascending=sort_asc, na_position="last")
 
-# ── Onglets par valeur ────────────────────────────────────────────────────────
-valeurs_affichees = [v for v in df_affiche["Valeur"].unique()]
+# ============================================================
+#  RÉSUMÉ CHIFFRÉ
+# ============================================================
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("Analysées", len(df))
+c2.metric("🟢 Value", int((df["Diagnostic"] == "🟢 Value / Fort potentiel").sum()))
+c3.metric("🔵 Croissance", int((df["Diagnostic"] == "🔵 Pure croissance").sum()))
+c4.metric("⚠️ Surchauffe", int((df["Diagnostic"] == "⚠️ Surchauffe").sum()))
+c5.metric("🔴 Non profitable", int((df["Diagnostic"] == "🔴 Non profitable").sum()))
 
-if not valeurs_affichees:
-    st.info("Aucun article ne correspond aux filtres.")
-    st.stop()
+# ============================================================
+#  TABLEAU
+# ============================================================
+st.subheader(f"Résultats ({len(filtered)} valeur(s) après filtres)")
 
-tabs = st.tabs([f"  {v}  " for v in valeurs_affichees])
-
-for tab, valeur in zip(tabs, valeurs_affichees):
-    with tab:
-        idx     = [w["nom"] for w in watchlist].index(valeur) if valeur in [w["nom"] for w in watchlist] else 0
-        couleur = COULEURS[idx % len(COULEURS)]
-        ticker  = df_affiche.loc[df_affiche["Valeur"] == valeur, "Ticker"].iloc[0]
-        sous_df = df_affiche[df_affiche["Valeur"] == valeur]
-
-        st.markdown(
-            f'<span class="ticker-badge" style="background:{couleur};">{ticker}</span>'
-            f'<strong style="font-size:1.1rem;">{valeur}</strong> · '
-            f'<span style="color:#888;font-size:.85rem;">{len(sous_df)} article(s)</span>',
-            unsafe_allow_html=True,
-        )
-        st.write("")
-
-        for _, row in sous_df.iterrows():
-            lien_bouton = (
-                f'<a class="read-link" href="{row["Lien"]}" target="_blank">🔗 Lire l\'article</a>'
-                if row["Lien"] and row["Lien"] != "—" else ""
-            )
-            st.markdown(f"""
-            <div class="article-card" style="border-left-color:{couleur};">
-              <div class="article-title">{row['Titre']}</div>
-              <div class="article-meta">
-                <span>📅 {row['Date']}</span>
-                <span>📡 {row['Source']}</span>
-              </div>
-              {lien_bouton}
-            </div>
-            """, unsafe_allow_html=True)
-
-# ── Export CSV ────────────────────────────────────────────────────────────────
-st.divider()
-csv = df_affiche.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-st.download_button(
-    label="⬇️ Télécharger en CSV",
-    data=csv,
-    file_name=f"rapport_news_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-    mime="text/csv",
+st.dataframe(
+    filtered,
+    use_container_width=True,
+    hide_index=True,
+    column_config={
+        "Prix": st.column_config.NumberColumn(format="$%.2f"),
+        "P/E": st.column_config.NumberColumn(format="%.1f"),
+        "Forward P/E": st.column_config.NumberColumn(format="%.1f"),
+        "PEG": st.column_config.NumberColumn(format="%.2f"),
+        "Marge Opé (%)": st.column_config.NumberColumn(format="%.1f%%"),
+        "EPS next Y (%)": st.column_config.NumberColumn(format="%.1f%%"),
+        "EPS next 5Y (%)": st.column_config.NumberColumn(format="%.1f%%"),
+        "ROE (%)": st.column_config.NumberColumn(format="%.1f%%"),
+        "Debt/Eq": st.column_config.NumberColumn(format="%.2f"),
+        "RSI (14)": st.column_config.NumberColumn(format="%.1f"),
+        "Dist. 52W High (%)": st.column_config.NumberColumn(format="%.1f%%"),
+    },
 )
+
+csv_bytes = filtered.to_csv(index=False).encode("utf-8-sig")
+st.download_button(
+    "💾 Télécharger en CSV", csv_bytes,
+    file_name="rapport_finviz.csv", mime="text/csv",
+)
+
+# ============================================================
+#  GRAPHIQUE — PEG vs croissance EPS
+# ============================================================
+chart_data = filtered.dropna(subset=["PEG", "EPS next Y (%)"])
+if not chart_data.empty:
+    st.subheader("PEG vs croissance EPS estimée (N+1)")
+    chart = (
+        alt.Chart(chart_data)
+        .mark_circle(size=140, opacity=0.8)
+        .encode(
+            x=alt.X("PEG", title="PEG Ratio"),
+            y=alt.Y("EPS next Y (%)", title="Croissance EPS estimée (%)"),
+            color=alt.Color("Diagnostic", title="Diagnostic"),
+            tooltip=["Ticker", "PEG", "EPS next Y (%)", "Forward P/E", "Diagnostic"],
+        )
+        .interactive()
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+# ============================================================
+#  ERREURS DE RÉCUPÉRATION
+# ============================================================
+if st.session_state.errors:
+    with st.expander(f"⚠️ {len(st.session_state.errors)} erreur(s) de récupération"):
+        for err in st.session_state.errors:
+            st.write(f"- {err}")
