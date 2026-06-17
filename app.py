@@ -11,7 +11,9 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 import altair as alt
-import yfinance as yf
+import requests
+import re
+import json
 from finvizfinance.quote import finvizfinance
 
 # ============================================================
@@ -42,7 +44,8 @@ KEY_MAP = {
     "debt_eq": "Debt/Eq",
     "roe": "ROE",
     "price": "Price",
-    "52w_high": "52W High",
+    "52w_high": "52W Range To",
+    "52w_low": "52W Range From",
     "target_price": "Target Price",
     "optionable": "Optionable",
 }
@@ -54,6 +57,12 @@ DIAGNOSTIC_ORDER = [
     "⚠️ Surchauffe",
     "🔴 Non profitable",
 ]
+
+# Même User-Agent que celui utilisé par la lib finvizfinance (a fait ses preuves sur ce site)
+FINVIZ_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_4) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/81.0.4044.138 Safari/537.36"
+}
 
 
 # ============================================================
@@ -107,38 +116,73 @@ def fetch_single(ticker: str, retries: int = 3):
                 return None, f"Échec définitif pour {ticker} : {e}"
 
 
-def fetch_put_call_oi_ratio(ticker: str):
+def fetch_put_call_oi_ratio(ticker: str, retries: int = 2):
     """
-    Calcule le ratio Put/Call sur l'Open Interest à partir de la chaîne
-    d'options de l'échéance la plus proche disponible (Yahoo Finance,
-    car Finviz ne fournit aucune donnée d'options).
+    Calcule le ratio Put/Call sur l'Open Interest directement depuis la page
+    options de Finviz (échéance la plus proche, sélectionnée par défaut).
 
-    Retourne (ratio, oi_calls, oi_puts, échéance) ou (None, None, None, None)
-    si le titre n'a pas d'options cotées ou en cas d'erreur réseau.
+    Finviz injecte la chaîne d'options complète en JSON dans une balise
+    <script id="route-init-data">, ce qui évite de parser un tableau HTML —
+    on additionne simplement les champs "openInterest" par type (call/put).
+
+    Retourne (ratio, oi_calls, oi_puts, échéance, erreur). `erreur` est None
+    en cas de succès, sinon une chaîne expliquant précisément ce qui a échoué
+    (HTTP, timeout, balise introuvable, etc.) pour pouvoir diagnostiquer
+    sans deviner.
     """
-    try:
-        tk = yf.Ticker(ticker)
-        expirations = tk.options  # tuple de dates "YYYY-MM-DD", triées
-        if not expirations:
-            return None, None, None, None
+    url = f"https://finviz.com/stock?t={ticker}&ty=oc"
+    headers = {
+        **FINVIZ_HEADERS,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://finviz.com/",
+    }
+    last_error = None
 
-        nearest_expiry = expirations[0]
-        chain = tk.option_chain(nearest_expiry)
-        time.sleep(random.uniform(0.5, 1.5))  # courtoisie anti-ban Yahoo
+    for attempt in range(retries):
+        try:
+            resp = requests.get(url, headers=headers, timeout=10)
+            resp.raise_for_status()
+            time.sleep(random.uniform(2.0, 4.0))  # courtoisie anti-ban Finviz
 
-        if chain.calls is None or chain.puts is None:
-            return None, None, None, None
+            match = re.search(
+                r'<script id="route-init-data" type="application/json">(.*?)</script>',
+                resp.text, re.DOTALL,
+            )
+            if not match:
+                return None, None, None, None, (
+                    f"{ticker} : balise route-init-data introuvable "
+                    f"(HTTP {resp.status_code}, {len(resp.text)} caractères reçus)"
+                )
 
-        oi_calls = int(chain.calls["openInterest"].fillna(0).sum())
-        oi_puts = int(chain.puts["openInterest"].fillna(0).sum())
+            data = json.loads(match.group(1))
+            options = data.get("options", [])
+            if not options:
+                return None, None, None, None, f"{ticker} : JSON valide mais liste 'options' vide"
 
-        if oi_calls == 0:
-            return None, oi_calls, oi_puts, nearest_expiry
+            oi_calls = sum(o.get("openInterest", 0) or 0 for o in options if o.get("type") == "call")
+            oi_puts = sum(o.get("openInterest", 0) or 0 for o in options if o.get("type") == "put")
+            expiry = data.get("currentExpiry")
 
-        ratio = round(oi_puts / oi_calls, 2)
-        return ratio, oi_calls, oi_puts, nearest_expiry
-    except Exception:
-        return None, None, None, None
+            if oi_calls == 0:
+                return None, oi_calls, oi_puts, expiry, f"{ticker} : OI calls = 0"
+
+            ratio = round(oi_puts / oi_calls, 2)
+            return ratio, oi_calls, oi_puts, expiry, None
+
+        except requests.exceptions.HTTPError as e:
+            last_error = f"{ticker} : erreur HTTP {e}"
+        except requests.exceptions.Timeout:
+            last_error = f"{ticker} : timeout après 10s"
+        except json.JSONDecodeError as e:
+            last_error = f"{ticker} : JSON invalide ({e})"
+        except Exception as e:
+            last_error = f"{ticker} : {type(e).__name__} - {e}"
+
+        if attempt < retries - 1:
+            time.sleep(3)
+
+    return None, None, None, None, last_error
 
 
 def score(peg, operating_margin, pe, eps_next_y, rsi):
@@ -205,7 +249,6 @@ def analyze_ticker(ticker: str, _cache_buster: int):
     price = clean_float(gm("price"))
     high_52w = clean_float(gm("52w_high"))
     target_price = clean_float(gm("target_price"))
-    optionable = (gm("optionable") or "").strip().lower() == "yes"
 
     dist_52w_high = None
     if price and high_52w:
@@ -215,10 +258,9 @@ def analyze_ticker(ticker: str, _cache_buster: int):
     if price and target_price:
         upside_target = round((target_price / price - 1) * 100, 1)
 
-    # Pas d'appel Yahoo pour les titres non optionables selon Finviz
-    pc_ratio = oi_calls = oi_puts = pc_expiry = None
-    if optionable:
-        pc_ratio, oi_calls, oi_puts, pc_expiry = fetch_put_call_oi_ratio(ticker)
+    # Toujours tenté : le champ "Optionable" de Finviz s'est révélé peu fiable
+    # comme filtre (faux négatifs sur des titres clairement optionables).
+    pc_ratio, oi_calls, oi_puts, pc_expiry, pc_error = fetch_put_call_oi_ratio(ticker)
 
     rating, reasons = score(peg, operating_margin, pe, eps_next_y, rsi)
 
@@ -257,6 +299,7 @@ def analyze_ticker(ticker: str, _cache_buster: int):
         "Diagnostic": rating,
         "Points clés": " | ".join(reasons) if reasons else "—",
         "_error": None,
+        "_pc_error": pc_error,
     }
 
 
@@ -266,6 +309,7 @@ def analyze_ticker(ticker: str, _cache_buster: int):
 st.session_state.setdefault("cache_buster", 0)
 st.session_state.setdefault("df", pd.DataFrame())
 st.session_state.setdefault("errors", [])
+st.session_state.setdefault("options_errors", [])
 st.session_state.setdefault("last_run", None)
 
 # ============================================================
@@ -317,8 +361,11 @@ if should_fetch:
     st.session_state.errors = (
         raw.loc[raw["_error"].notna(), "_error"].tolist() if "_error" in raw else []
     )
+    st.session_state.options_errors = (
+        raw.loc[raw["_pc_error"].notna(), "_pc_error"].tolist() if "_pc_error" in raw else []
+    )
     st.session_state.df = (
-        raw.loc[raw["_error"].isna()].drop(columns=["_error"])
+        raw.loc[raw["_error"].isna()].drop(columns=["_error", "_pc_error"], errors="ignore")
         if "_error" in raw else raw
     )
     st.session_state.last_run = datetime.now()
@@ -432,6 +479,11 @@ if not chart_data.empty:
 #  ERREURS DE RÉCUPÉRATION
 # ============================================================
 if st.session_state.errors:
-    with st.expander(f"⚠️ {len(st.session_state.errors)} erreur(s) de récupération"):
+    with st.expander(f"⚠️ {len(st.session_state.errors)} erreur(s) de récupération (fondamentaux Finviz)"):
         for err in st.session_state.errors:
+            st.write(f"- {err}")
+
+if st.session_state.options_errors:
+    with st.expander(f"⚠️ {len(st.session_state.options_errors)} erreur(s) Put/Call OI (page options Finviz)"):
+        for err in st.session_state.options_errors:
             st.write(f"- {err}")
