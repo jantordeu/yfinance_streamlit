@@ -116,20 +116,29 @@ def fetch_single(ticker: str, retries: int = 3):
 
 def parse_52w_range(fundament: dict):
     """
-    Extrait (low, high) du 52W Range, sans dépendre de la façon dont
-    finvizfinance a découpé le champ.
+    Extrait (low, high) à partir des champs "52W High" / "52W Low" de Finviz.
 
-    finvizfinance tente de splitter le texte brut Finviz (ex: "150.00 - 300.00")
-    en deux clés "52W Range From" / "52W Range To". Si le format affiché par
-    Finviz change (espaces, tiret différent), ce découpage échoue silencieusement
-    et toute la chaîne brute se retrouve sous la clé "52W Range" — d'où ce
-    parsing de secours, plus tolérant.
+    Sur la page actuelle, Finviz affiche ces deux champs séparément (pas de
+    "52W Range" combiné), mais chaque cellule contient le prix ET la distance
+    en % collés dans le même texte à cause du HTML imbriqué, ex :
+        "52W High" -> "1110.40 -2.84%"
+        "52W Low"  -> "103.38 943.56%"
+    On extrait uniquement le premier nombre (le prix), qui peut être négatif
+    si jamais Finviz change l'ordre d'affichage — d'où le \\-? optionnel.
     """
-    high = clean_float(get_metric(fundament, "52W Range To"))
-    low = clean_float(get_metric(fundament, "52W Range From"))
+    def leading_number(raw_value):
+        if not raw_value:
+            return None
+        match = re.match(r'\s*(-?[\d.,]+)', str(raw_value))
+        return clean_float(match.group(1)) if match else None
+
+    high = leading_number(get_metric(fundament, "52W High"))
+    low = leading_number(get_metric(fundament, "52W Low"))
+
     if high is not None and low is not None:
         return low, high
 
+    # Filet de sécurité si Finviz revient un jour à un champ combiné "52W Range"
     raw_range = get_metric(fundament, "52W Range")
     if raw_range:
         match = re.search(r'([\d.,]+)\s*[-–—]\s*([\d.,]+)', str(raw_range))
