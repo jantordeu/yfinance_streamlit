@@ -11,6 +11,7 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 import altair as alt
+import yfinance as yf
 from finvizfinance.quote import finvizfinance
 
 # ============================================================
@@ -42,6 +43,8 @@ KEY_MAP = {
     "roe": "ROE",
     "price": "Price",
     "52w_high": "52W High",
+    "target_price": "Target Price",
+    "optionable": "Optionable",
 }
 
 DIAGNOSTIC_ORDER = [
@@ -102,6 +105,40 @@ def fetch_single(ticker: str, retries: int = 3):
                 time.sleep(5 * (attempt + 1))
             else:
                 return None, f"Échec définitif pour {ticker} : {e}"
+
+
+def fetch_put_call_oi_ratio(ticker: str):
+    """
+    Calcule le ratio Put/Call sur l'Open Interest à partir de la chaîne
+    d'options de l'échéance la plus proche disponible (Yahoo Finance,
+    car Finviz ne fournit aucune donnée d'options).
+
+    Retourne (ratio, oi_calls, oi_puts, échéance) ou (None, None, None, None)
+    si le titre n'a pas d'options cotées ou en cas d'erreur réseau.
+    """
+    try:
+        tk = yf.Ticker(ticker)
+        expirations = tk.options  # tuple de dates "YYYY-MM-DD", triées
+        if not expirations:
+            return None, None, None, None
+
+        nearest_expiry = expirations[0]
+        chain = tk.option_chain(nearest_expiry)
+        time.sleep(random.uniform(0.5, 1.5))  # courtoisie anti-ban Yahoo
+
+        if chain.calls is None or chain.puts is None:
+            return None, None, None, None
+
+        oi_calls = int(chain.calls["openInterest"].fillna(0).sum())
+        oi_puts = int(chain.puts["openInterest"].fillna(0).sum())
+
+        if oi_calls == 0:
+            return None, oi_calls, oi_puts, nearest_expiry
+
+        ratio = round(oi_puts / oi_calls, 2)
+        return ratio, oi_calls, oi_puts, nearest_expiry
+    except Exception:
+        return None, None, None, None
 
 
 def score(peg, operating_margin, pe, eps_next_y, rsi):
@@ -167,16 +204,42 @@ def analyze_ticker(ticker: str, _cache_buster: int):
     roe = clean_float(gm("roe"))
     price = clean_float(gm("price"))
     high_52w = clean_float(gm("52w_high"))
+    target_price = clean_float(gm("target_price"))
+    optionable = (gm("optionable") or "").strip().lower() == "yes"
 
     dist_52w_high = None
     if price and high_52w:
         dist_52w_high = round((price / high_52w - 1) * 100, 1)
 
+    upside_target = None
+    if price and target_price:
+        upside_target = round((target_price / price - 1) * 100, 1)
+
+    # Pas d'appel Yahoo pour les titres non optionables selon Finviz
+    pc_ratio = oi_calls = oi_puts = pc_expiry = None
+    if optionable:
+        pc_ratio, oi_calls, oi_puts, pc_expiry = fetch_put_call_oi_ratio(ticker)
+
     rating, reasons = score(peg, operating_margin, pe, eps_next_y, rsi)
+
+    # Enrichissement informatif du diagnostic (n'altère pas la catégorie de rating)
+    if upside_target is not None:
+        if upside_target > 15:
+            reasons.append(f"Potentiel vs target +{upside_target:.1f}%")
+        elif upside_target < -10:
+            reasons.append(f"Déjà {abs(upside_target):.1f}% au-dessus du target")
+
+    if pc_ratio is not None:
+        if pc_ratio > 1.0:
+            reasons.append(f"Sentiment optionnel baissier (Put/Call OI={pc_ratio:.2f})")
+        elif pc_ratio < 0.7:
+            reasons.append(f"Sentiment optionnel haussier (Put/Call OI={pc_ratio:.2f})")
 
     return {
         "Ticker": ticker,
         "Prix": price,
+        "Target Price": target_price,
+        "Potentiel vs Target (%)": upside_target,
         "P/E": pe,
         "Forward P/E": fwd_pe,
         "PEG": peg,
@@ -187,6 +250,10 @@ def analyze_ticker(ticker: str, _cache_buster: int):
         "Debt/Eq": debt_eq,
         "RSI (14)": rsi,
         "Dist. 52W High (%)": dist_52w_high,
+        "Put/Call OI": pc_ratio,
+        "OI Calls": oi_calls,
+        "OI Puts": oi_puts,
+        "Échéance Options": pc_expiry,
         "Diagnostic": rating,
         "Points clés": " | ".join(reasons) if reasons else "—",
         "_error": None,
@@ -283,6 +350,9 @@ with filters_placeholder:
 
     rsi_range = st.slider("RSI (14)", 0, 100, (0, 100))
 
+    pc_ceiling = float(max(3.0, df["Put/Call OI"].max(skipna=True) or 3.0))
+    pc_range = st.slider("Put/Call OI Ratio", 0.0, pc_ceiling, (0.0, pc_ceiling))
+
     sortable_cols = [c for c in df.columns if c not in ("Ticker", "Points clés")]
     default_sort = "Dist. 52W High (%)" if "Dist. 52W High (%)" in sortable_cols else sortable_cols[0]
     sort_col = st.selectbox("Trier par", sortable_cols, index=sortable_cols.index(default_sort))
@@ -291,6 +361,7 @@ with filters_placeholder:
 mask = df["Diagnostic"].isin(selected_diag)
 mask &= df["PEG"].isna() | df["PEG"].between(*peg_range)
 mask &= df["RSI (14)"].isna() | df["RSI (14)"].between(*rsi_range)
+mask &= df["Put/Call OI"].isna() | df["Put/Call OI"].between(*pc_range)
 filtered = df.loc[mask].sort_values(sort_col, ascending=sort_asc, na_position="last")
 
 # ============================================================
@@ -314,6 +385,8 @@ st.dataframe(
     hide_index=True,
     column_config={
         "Prix": st.column_config.NumberColumn(format="$%.2f"),
+        "Target Price": st.column_config.NumberColumn(format="$%.2f"),
+        "Potentiel vs Target (%)": st.column_config.NumberColumn(format="%.1f%%"),
         "P/E": st.column_config.NumberColumn(format="%.1f"),
         "Forward P/E": st.column_config.NumberColumn(format="%.1f"),
         "PEG": st.column_config.NumberColumn(format="%.2f"),
@@ -324,6 +397,9 @@ st.dataframe(
         "Debt/Eq": st.column_config.NumberColumn(format="%.2f"),
         "RSI (14)": st.column_config.NumberColumn(format="%.1f"),
         "Dist. 52W High (%)": st.column_config.NumberColumn(format="%.1f%%"),
+        "Put/Call OI": st.column_config.NumberColumn(format="%.2f"),
+        "OI Calls": st.column_config.NumberColumn(format="%d"),
+        "OI Puts": st.column_config.NumberColumn(format="%d"),
     },
 )
 
